@@ -491,6 +491,12 @@ class ReferringMaskLoss(nn.Module):
             log_prob = stable_logits - torch.log(exp_logits_input.clamp_min(1e-12))
             return -(log_prob[pos_mask].sum() / pos_mask.sum().clamp_min(1))
 
+        if self.contrastive_loss_version == "set_infonce":
+            stable_logits = logits - logits.max().detach()
+            log_pos = torch.logsumexp(stable_logits[pos_mask], dim=0)
+            log_all = torch.logsumexp(stable_logits[pos_mask | neg_mask], dim=0)
+            return -(log_pos - log_all)
+
         raise ValueError(f"Unknown contrastive_loss_version: {self.contrastive_loss_version}")
 
     def _cross_text_mask_ratios(self, instance_maps, scene_ids, object_ids):

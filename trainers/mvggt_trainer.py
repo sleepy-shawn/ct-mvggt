@@ -84,9 +84,15 @@ class MVGGTTrainer(BaseTrainer):
         imgs = torch.stack([view['img'] for view in batched_views], dim=1)
         input_ids = batched_text['input_ids']
         attention_mask = batched_text['attention_mask']
+        scene_text_features = batched_text.get('scene_text_features')
 
         # Forward pass through the model
-        pred = self.model(imgs, input_ids=input_ids, attention_mask=attention_mask)
+        pred = self.model(
+            imgs,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            scene_text_features=scene_text_features,
+        )
         
         
         return [pred, batch]
@@ -96,10 +102,10 @@ class MVGGTTrainer(BaseTrainer):
         batched_views, batched_text = batch
 
         if mode == 'train':
-            loss, details = self.train_loss(output, batched_views)
+            loss, details = self.train_loss(output, batched_views, text_info=batched_text)
             #loss, details = self.train_loss(output, batched_views, current_epoch=current_epoch, total_epochs=total_epochs)
         else:
-            loss, details = self.test_loss(output, batched_views)
+            loss, details = self.test_loss(output, batched_views, text_info=batched_text)
 
         return EasyDict(
             loss=loss,

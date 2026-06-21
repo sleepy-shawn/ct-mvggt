@@ -373,12 +373,290 @@ def iou_score_per_view(
     return score_per_view
 
 class ReferringMaskLoss(nn.Module):
-    def __init__(self, weight_dict=None, layer_weight=0.5,):
+    def __init__(
+        self,
+        weight_dict=None,
+        layer_weight=0.5,
+        contrastive_temperature=0.1,
+        contrastive_mode=None,
+        contrastive_mask_ratio_threshold=0.2,
+        contrastive_mask_ratio_metric="view_presence",
+    ):
         super().__init__()
         self.weight_dict = weight_dict if weight_dict is not None else {'loss_mask': 1, 'loss_dice': 1}
         self.layer_weight = layer_weight
+        self.contrastive_temperature = contrastive_temperature
+        self.contrastive_mode = contrastive_mode
+        self.contrastive_mask_ratio_threshold = contrastive_mask_ratio_threshold
+        self.contrastive_mask_ratio_metric = contrastive_mask_ratio_metric
 
-    def forward(self, pred, gt, current_epoch=None, total_epochs=None):
+    @staticmethod
+    def _metadata_to_str_list(values):
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().tolist()
+        return [str(value) for value in values]
+
+    @staticmethod
+    def _metadata_to_int_list(values):
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().tolist()
+        output = []
+        for value in values:
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            output.append(int(value))
+        return output
+
+    def _pool_text_features(self, text_features, attention_mask):
+        if attention_mask is None:
+            attention_mask = torch.ones(text_features.shape[:2], device=text_features.device)
+        mask = attention_mask.to(device=text_features.device, dtype=text_features.dtype)
+        denom = mask.sum(dim=1, keepdim=True)
+        pooled = (text_features * mask.unsqueeze(-1)).sum(dim=1) / denom.clamp_min(1.0)
+        valid = denom.squeeze(1) > 0
+        return pooled, valid
+
+    def _pool_anchor_patch_features(self, patch_features, gt_masks, patch_shape):
+        B, V, _, _ = gt_masks.shape
+        patch_h, patch_w = patch_shape
+        mask_weights = F.interpolate(
+            gt_masks.float().reshape(B * V, 1, *gt_masks.shape[-2:]),
+            size=(patch_h, patch_w),
+            mode='area',
+        ).reshape(B, V, patch_h * patch_w)
+
+        patch_features = patch_features.float()
+        weight_sum = mask_weights.sum(dim=(1, 2))
+        pooled = (patch_features * mask_weights.unsqueeze(-1)).sum(dim=(1, 2))
+        pooled = pooled / weight_sum.clamp_min(1e-6).unsqueeze(-1)
+        valid = weight_sum > 1e-6
+        return pooled, valid
+
+    def _multi_pos_cross_entropy(self, logits, pos_mask, neg_mask):
+        losses = []
+        pos_counts = []
+        neg_counts = []
+        for anchor_idx in range(logits.shape[0]):
+            pos_logits = logits[anchor_idx][pos_mask[anchor_idx]]
+            neg_logits = logits[anchor_idx][neg_mask[anchor_idx]]
+            if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+                continue
+
+            diff = neg_logits[:, None] - pos_logits[None, :]
+            diff = diff.reshape(-1)
+            diff = torch.cat([diff, logits.new_zeros(1)], dim=0)
+            losses.append(torch.logsumexp(diff, dim=0))
+            pos_counts.append(float(pos_logits.numel()))
+            neg_counts.append(float(neg_logits.numel()))
+
+        if len(losses) == 0:
+            zero = logits.sum() * 0.0
+            return zero, logits.new_tensor(0.0), logits.new_tensor(0.0), logits.new_tensor(0.0)
+
+        loss = torch.stack(losses).mean()
+        valid_anchor_rate = logits.new_tensor(len(losses) / logits.shape[0])
+        mean_pos_count = logits.new_tensor(sum(pos_counts) / len(pos_counts))
+        mean_neg_count = logits.new_tensor(sum(neg_counts) / len(neg_counts))
+        return loss, valid_anchor_rate, mean_pos_count, mean_neg_count
+
+    def _cross_text_mask_ratios(self, instance_maps, scene_ids, object_ids):
+        B, V, H, W = instance_maps.shape
+        ratios = instance_maps.new_zeros((B, B), dtype=torch.float32)
+        same_scene = torch.zeros((B, B), device=instance_maps.device, dtype=torch.bool)
+
+        for anchor_idx in range(B):
+            for text_idx in range(B):
+                if scene_ids[anchor_idx] != scene_ids[text_idx]:
+                    continue
+                same_scene[anchor_idx, text_idx] = True
+                object_instance_id = int(object_ids[text_idx]) + 1
+                object_mask = instance_maps[anchor_idx] == object_instance_id
+                if self.contrastive_mask_ratio_metric == "view_presence":
+                    ratios[anchor_idx, text_idx] = object_mask.flatten(1).any(dim=1).float().mean()
+                elif self.contrastive_mask_ratio_metric == "pixel_area":
+                    ratios[anchor_idx, text_idx] = object_mask.float().mean()
+                else:
+                    raise ValueError(
+                        f"Unknown contrastive_mask_ratio_metric: {self.contrastive_mask_ratio_metric}"
+                    )
+
+        return ratios, same_scene
+
+    def _patch_anchor_text_mask_ratio_loss(self, pred, gt_masks, instance_maps, text_info):
+        required_keys = (
+            'contrastive_patch_features',
+            'contrastive_patch_shape',
+            'contrastive_text_features',
+            'contrastive_attention_mask',
+        )
+        if instance_maps is None or text_info is None or any(key not in pred or pred[key] is None for key in required_keys):
+            zero = gt_masks.float().sum() * 0.0
+            return zero, {
+                'contrastive_valid_anchor_rate': zero.detach(),
+                'contrastive_mean_pos_count': zero.detach(),
+                'contrastive_mean_neg_count': zero.detach(),
+                'contrastive_mean_pos_mask_ratio': zero.detach(),
+                'contrastive_mean_neg_mask_ratio': zero.detach(),
+            }
+
+        patch_features = pred['contrastive_patch_features']
+        patch_shape = pred['contrastive_patch_shape']
+        text_features = pred['contrastive_text_features']
+        attention_mask = pred['contrastive_attention_mask']
+
+        anchor_features, valid_anchor = self._pool_anchor_patch_features(patch_features, gt_masks, patch_shape)
+        text_features, valid_text = self._pool_text_features(text_features, attention_mask)
+        anchor_features = F.normalize(anchor_features, dim=-1)
+        text_features = F.normalize(text_features.float(), dim=-1)
+        logits = anchor_features @ text_features.T
+        logits = logits / self.contrastive_temperature
+
+        B = logits.shape[0]
+        scene_ids = self._metadata_to_str_list(text_info.get('scene_id'))
+        object_ids = self._metadata_to_int_list(text_info.get('object_id'))
+        if scene_ids is None or object_ids is None or len(scene_ids) != B or len(object_ids) != B:
+            zero = logits.sum() * 0.0
+            return zero, {
+                'contrastive_valid_anchor_rate': zero.detach(),
+                'contrastive_mean_pos_count': zero.detach(),
+                'contrastive_mean_neg_count': zero.detach(),
+                'contrastive_mean_pos_mask_ratio': zero.detach(),
+                'contrastive_mean_neg_mask_ratio': zero.detach(),
+            }
+
+        ratios, same_scene = self._cross_text_mask_ratios(instance_maps.long(), scene_ids, object_ids)
+        valid_pairs = valid_anchor[:, None] & valid_text[None, :] & same_scene
+        pos_mask = (ratios > self.contrastive_mask_ratio_threshold) & valid_pairs
+        neg_mask = (ratios < self.contrastive_mask_ratio_threshold) & valid_pairs
+
+        loss, valid_anchor_rate, mean_pos_count, mean_neg_count = self._multi_pos_cross_entropy(
+            logits,
+            pos_mask,
+            neg_mask,
+        )
+        zero = logits.sum() * 0.0
+        pos_ratios = ratios[pos_mask]
+        neg_ratios = ratios[neg_mask]
+        return loss, {
+            'contrastive_valid_anchor_rate': valid_anchor_rate.detach(),
+            'contrastive_mean_pos_count': mean_pos_count.detach(),
+            'contrastive_mean_neg_count': mean_neg_count.detach(),
+            'contrastive_mean_pos_mask_ratio': (pos_ratios.mean() if pos_ratios.numel() > 0 else zero).detach(),
+            'contrastive_mean_neg_mask_ratio': (neg_ratios.mean() if neg_ratios.numel() > 0 else zero).detach(),
+        }
+
+    @staticmethod
+    def _ragged_item(values, idx):
+        if values is None:
+            return None
+        if torch.is_tensor(values):
+            return values[idx]
+        return values[idx]
+
+    def _patch_anchor_scene_object_text_loss(self, pred, gt_masks, text_info):
+        required_keys = (
+            'contrastive_patch_features',
+            'contrastive_patch_shape',
+            'contrastive_scene_text_features',
+        )
+        zero = gt_masks.float().sum() * 0.0
+        if text_info is None or any(key not in pred or pred[key] is None for key in required_keys):
+            return zero, {
+                'contrastive_valid_anchor_rate': zero.detach(),
+                'contrastive_mean_pos_count': zero.detach(),
+                'contrastive_mean_neg_count': zero.detach(),
+                'contrastive_mean_scene_text_count': zero.detach(),
+                'contrastive_mean_pos_rank': zero.detach(),
+                'contrastive_pos_neg_pair_accuracy': zero.detach(),
+            }
+
+        scene_text_object_ids = text_info.get('scene_text_object_ids')
+        object_ids = self._metadata_to_int_list(text_info.get('object_id'))
+        if scene_text_object_ids is None or object_ids is None:
+            return zero, {
+                'contrastive_valid_anchor_rate': zero.detach(),
+                'contrastive_mean_pos_count': zero.detach(),
+                'contrastive_mean_neg_count': zero.detach(),
+                'contrastive_mean_scene_text_count': zero.detach(),
+                'contrastive_mean_pos_rank': zero.detach(),
+                'contrastive_pos_neg_pair_accuracy': zero.detach(),
+            }
+
+        patch_features = pred['contrastive_patch_features']
+        patch_shape = pred['contrastive_patch_shape']
+        scene_text_features = pred['contrastive_scene_text_features']
+        anchor_features, valid_anchor = self._pool_anchor_patch_features(patch_features, gt_masks, patch_shape)
+        anchor_features = F.normalize(anchor_features, dim=-1)
+
+        losses = []
+        pos_counts = []
+        neg_counts = []
+        scene_text_counts = []
+        pos_ranks = []
+        pair_accuracies = []
+        for anchor_idx in range(anchor_features.shape[0]):
+            if not bool(valid_anchor[anchor_idx].item()):
+                continue
+
+            text_features = self._ragged_item(scene_text_features, anchor_idx)
+            text_object_ids = self._ragged_item(scene_text_object_ids, anchor_idx)
+            if text_features is None or text_object_ids is None:
+                continue
+
+            text_features = text_features.to(device=anchor_features.device, dtype=anchor_features.dtype)
+            text_object_ids = text_object_ids.to(device=anchor_features.device, dtype=torch.long)
+            if text_features.numel() == 0 or text_object_ids.numel() == 0:
+                continue
+
+            target_object_id = int(object_ids[anchor_idx])
+            text_features = F.normalize(text_features.float(), dim=-1)
+            logits = anchor_features[anchor_idx].float() @ text_features.T
+            logits = logits / self.contrastive_temperature
+
+            pos_mask = text_object_ids == target_object_id
+            neg_mask = text_object_ids != target_object_id
+            pos_logits = logits[pos_mask]
+            neg_logits = logits[neg_mask]
+            if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+                continue
+
+            pos_rank = 1.0 + (logits[None, :] > pos_logits[:, None]).float().sum(dim=1)
+            pos_neg_pair_accuracy = (pos_logits[:, None] > neg_logits[None, :]).float().mean()
+            diff = neg_logits[:, None] - pos_logits[None, :]
+            diff = diff.reshape(-1)
+            diff = torch.cat([diff, logits.new_zeros(1)], dim=0)
+            losses.append(torch.logsumexp(diff, dim=0))
+            pos_counts.append(float(pos_logits.numel()))
+            neg_counts.append(float(neg_logits.numel()))
+            scene_text_counts.append(float(text_features.shape[0]))
+            pos_ranks.append(float(pos_rank.mean().item()))
+            pair_accuracies.append(float(pos_neg_pair_accuracy.item()))
+
+        if len(losses) == 0:
+            return zero, {
+                'contrastive_valid_anchor_rate': zero.detach(),
+                'contrastive_mean_pos_count': zero.detach(),
+                'contrastive_mean_neg_count': zero.detach(),
+                'contrastive_mean_scene_text_count': zero.detach(),
+                'contrastive_mean_pos_rank': zero.detach(),
+                'contrastive_pos_neg_pair_accuracy': zero.detach(),
+            }
+
+        loss = torch.stack(losses).mean()
+        return loss, {
+            'contrastive_valid_anchor_rate': loss.new_tensor(len(losses) / anchor_features.shape[0]).detach(),
+            'contrastive_mean_pos_count': loss.new_tensor(sum(pos_counts) / len(pos_counts)).detach(),
+            'contrastive_mean_neg_count': loss.new_tensor(sum(neg_counts) / len(neg_counts)).detach(),
+            'contrastive_mean_scene_text_count': loss.new_tensor(sum(scene_text_counts) / len(scene_text_counts)).detach(),
+            'contrastive_mean_pos_rank': loss.new_tensor(sum(pos_ranks) / len(pos_ranks)).detach(),
+            'contrastive_pos_neg_pair_accuracy': loss.new_tensor(sum(pair_accuracies) / len(pair_accuracies)).detach(),
+        }
+
+    def forward(self, pred, gt, text_info=None, current_epoch=None, total_epochs=None):
         pred_masks = pred['referring_mask_pred']
         gt_masks = gt['referring_masks'] # (B, V, H, W)
         
@@ -393,6 +671,27 @@ class ReferringMaskLoss(nn.Module):
         # iou score just in frame with target
         losses["iou_score_in_frame_with_target"] = iou_score(pred_masks, gt_masks)
         total_loss = self.weight_dict['loss_mask'] * losses['loss_mask'] + self.weight_dict['loss_dice'] * losses['loss_dice']
+        contrastive_weight = self.weight_dict.get('loss_contrastive', 0.0)
+        if contrastive_weight > 0:
+            if self.contrastive_mode == "patch_anchor_text_mask_ratio":
+                contrastive_loss, contrastive_details = self._patch_anchor_text_mask_ratio_loss(
+                    pred,
+                    gt_masks,
+                    gt.get('instance_maps'),
+                    text_info,
+                )
+            elif self.contrastive_mode == "patch_anchor_scene_object_text":
+                contrastive_loss, contrastive_details = self._patch_anchor_scene_object_text_loss(
+                    pred,
+                    gt_masks,
+                    text_info,
+                )
+            else:
+                raise ValueError(f"Unknown contrastive_mode: {self.contrastive_mode}")
+
+            losses["loss_contrastive"] = contrastive_loss
+            losses.update(contrastive_details)
+            total_loss += contrastive_weight * contrastive_loss
         # Record the proportion of samples without a target, i.e., the proportion of samples where all views have no target.
         view_has_target = (gt_masks.sum(dim=(-1, -2)) > 0).float() # (B, V)
         sample_no_target = (view_has_target.sum(-1) == 0).float() # (B)
@@ -444,6 +743,10 @@ class MVGGTLoss(nn.Module):
         use_referring_segmentation=False,
         referring_loss_weight_dict=None,
         referring_layer_weight=0.5,
+        contrastive_temperature=0.1,
+        contrastive_mode=None,
+        contrastive_mask_ratio_threshold=0.2,
+        contrastive_mask_ratio_metric="view_presence",
     ):
         super().__init__()
         self.point_loss = PointLoss(train_conf=train_conf)
@@ -453,6 +756,10 @@ class MVGGTLoss(nn.Module):
             self.referring_mask_loss = ReferringMaskLoss(
                 weight_dict=referring_loss_weight_dict,
                 layer_weight=referring_layer_weight,
+                contrastive_temperature=contrastive_temperature,
+                contrastive_mode=contrastive_mode,
+                contrastive_mask_ratio_threshold=contrastive_mask_ratio_threshold,
+                contrastive_mask_ratio_metric=contrastive_mask_ratio_metric,
             )
 
     def prepare_gt(self, gt):
@@ -461,6 +768,9 @@ class MVGGTLoss(nn.Module):
         poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
         if self.use_referring_segmentation and gt[0]['referring_mask'] is not None:
             referring_masks = torch.stack([view['referring_mask'] for view in gt], dim=1)
+        instance_maps = None
+        if self.use_referring_segmentation and 'instance_map' in gt[0] and gt[0]['instance_map'] is not None:
+            instance_maps = torch.stack([view['instance_map'] for view in gt], dim=1)
 
         B, N, H, W, _ = gt_pts.shape
 
@@ -494,6 +804,7 @@ class MVGGTLoss(nn.Module):
             valid_masks=masks,
             camera_poses=poses,
             referring_masks=referring_masks if self.use_referring_segmentation else None,
+            instance_maps=instance_maps,
             dataset_names=dataset_names
         )
     
@@ -522,7 +833,7 @@ class MVGGTLoss(nn.Module):
 
         return pred
 
-    def forward(self, pred, gt_raw, current_epoch=None, total_epochs=None):
+    def forward(self, pred, gt_raw, text_info=None, current_epoch=None, total_epochs=None):
         gt = self.prepare_gt(gt_raw)
         pred = self.normalize_pred(pred, gt)
 
@@ -540,7 +851,13 @@ class MVGGTLoss(nn.Module):
         details.update(camera_loss_details)
 
         if self.use_referring_segmentation and 'referring_mask_pred' in pred and 'referring_masks' in gt:
-            referring_loss, referring_loss_details = self.referring_mask_loss(pred, gt, current_epoch=current_epoch, total_epochs=total_epochs)
+            referring_loss, referring_loss_details = self.referring_mask_loss(
+                pred,
+                gt,
+                text_info=text_info,
+                current_epoch=current_epoch,
+                total_epochs=total_epochs,
+            )
             final_loss += referring_loss
             details.update(referring_loss_details)
 

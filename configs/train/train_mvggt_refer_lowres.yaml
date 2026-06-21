@@ -5,6 +5,8 @@ trainer: trainers.mvggt_trainer.MVGGTTrainer
 train:
   image_num_range: [4, 4]
   max_img_per_gpu: 64
+  same_scene_in_batch: false
+  same_scene_fill_strategy: random
 
   # low resolution
   resolution: 
@@ -23,7 +25,7 @@ test:
     batch_size: 1
     print_freq: 10
     iters_per_test: -1
-    image_num_range: [8, 8]
+    image_num_range: [4, 4]
     # low resolution
     resolution: 
     - [518, 336]
@@ -38,6 +40,11 @@ loss:
     referring_loss_weight_dict:
       loss_mask: 1.0
       loss_dice: 1.0
+      loss_contrastive: 0.1
+    contrastive_temperature: 0.1
+    contrastive_mode: patch_anchor_text_mask_ratio
+    contrastive_mask_ratio_threshold: 0.2
+    contrastive_mask_ratio_metric: view_presence
 
   test_loss:
     use_referring_segmentation: true

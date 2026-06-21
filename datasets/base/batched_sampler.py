@@ -102,7 +102,9 @@ class DynamicBatchSampler(Sampler):
                  epoch=0,
                  seed=42,
                  rank=0,
-                 max_img_per_gpu=48):
+                 max_img_per_gpu=48,
+                 same_scene_in_batch=False,
+                 same_scene_fill_strategy="random"):
         """
         Initializes the dynamic batch sampler.
 
@@ -134,10 +136,51 @@ class DynamicBatchSampler(Sampler):
         self.max_img_per_gpu = max_img_per_gpu
 
         self.rank = rank
+        self.same_scene_in_batch = same_scene_in_batch
+        self.same_scene_fill_strategy = same_scene_fill_strategy
+        if self.same_scene_fill_strategy not in ("random",):
+            raise ValueError(f"Unknown same_scene_fill_strategy: {self.same_scene_fill_strategy}")
 
         # Set the epoch for the sampler
         self.set_epoch(epoch + seed)
 
+    def _same_scene_batch_items(self, anchor_item, batch_size, resolution_idx, image_num):
+        dataset = getattr(self.sampler, "dataset", None)
+        if (
+            dataset is None
+            or not hasattr(dataset, "get_scene_id_for_sample")
+            or not hasattr(dataset, "get_sample_indices_for_scene")
+        ):
+            return None
+
+        anchor_idx = int(anchor_item[0])
+        scene_id = dataset.get_scene_id_for_sample(anchor_idx)
+        candidate_indices = list(dataset.get_sample_indices_for_scene(scene_id))
+        candidate_indices = [int(idx) for idx in candidate_indices if int(idx) != anchor_idx]
+        self.rng_rank.shuffle(candidate_indices)
+
+        sample_count = batch_size - 1
+        if hasattr(dataset, "get_object_id_for_sample") and len(candidate_indices) > 0:
+            anchor_object_id = str(dataset.get_object_id_for_sample(anchor_idx))
+            diff_object_indices = [
+                idx for idx in candidate_indices
+                if str(dataset.get_object_id_for_sample(idx)) != anchor_object_id
+            ]
+            same_object_indices = [
+                idx for idx in candidate_indices
+                if str(dataset.get_object_id_for_sample(idx)) == anchor_object_id
+            ]
+            ordered_candidates = diff_object_indices + same_object_indices
+        else:
+            ordered_candidates = candidate_indices
+
+        current_batch = [anchor_item]
+        current_batch.extend((idx, resolution_idx, image_num) for idx in ordered_candidates[:sample_count])
+        return current_batch
+
+    @staticmethod
+    def _sample_idx(item):
+        return int(item[0])
 
     def set_epoch(self, epoch, base_seed=777):
         """
@@ -177,14 +220,38 @@ class DynamicBatchSampler(Sampler):
                 batch_size = np.floor(batch_size).astype(int)
                 batch_size = max(1, batch_size)  # Ensure batch size is at least 1
 
-                # Collect samples for the current batch
-                current_batch = []
-                for _ in range(batch_size):
-                    try:
-                        item = next(sampler_iterator)  # item is (idx, aspect_ratio, image_num)
-                        current_batch.append(item)
-                    except StopIteration:
-                        break  # No more samples
+                try:
+                    item = next(sampler_iterator)  # item is (idx, aspect_ratio, image_num)
+                except StopIteration:
+                    break
+
+                if self.same_scene_in_batch:
+                    current_batch = self._same_scene_batch_items(
+                        item,
+                        batch_size,
+                        resolution_idx,
+                        random_image_num,
+                    )
+                else:
+                    current_batch = None
+
+                if current_batch is None or not current_batch:
+                    current_batch = [item]
+
+                if len(current_batch) < batch_size:
+                    seen_indices = {self._sample_idx(batch_item) for batch_item in current_batch}
+                    max_attempts = batch_size * 4
+                    attempts = 0
+                    while len(current_batch) < batch_size and attempts < max_attempts:
+                        attempts += 1
+                        try:
+                            item = next(sampler_iterator)  # item is (idx, aspect_ratio, image_num)
+                            if self._sample_idx(item) in seen_indices:
+                                continue
+                            current_batch.append(item)
+                            seen_indices.add(self._sample_idx(item))
+                        except StopIteration:
+                            break  # No more samples
 
                 if not current_batch:
                     break  # No more data to yield

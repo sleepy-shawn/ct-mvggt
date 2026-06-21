@@ -297,8 +297,16 @@ def unified_collate_fn(batch):
                 batched_views[i][key] = data
 
     # --- 2. Process text_info_batch ---
-    # text_info_batch is a list of dicts, perfect for default_collate
-    batched_text = default_collate(text_info_batch)
+    # Some optional text fields, such as scene-level text banks, are variable
+    # length. Collate fixed-size fields normally and keep ragged fields as lists.
+    batched_text = {}
+    all_text_keys = text_info_batch[0].keys()
+    for key in all_text_keys:
+        data = [text_info.get(key, None) for text_info in text_info_batch]
+        try:
+            batched_text[key] = default_collate(data)
+        except Exception:
+            batched_text[key] = data
 
     return batched_views, batched_text
 

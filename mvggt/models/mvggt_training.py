@@ -161,6 +161,7 @@ class MVGGT(nn.Module):
             pretrained_model_name_or_path=None,
             use_referring_segmentation=False,
             text_model_name='./ckpts/roberta-base',
+            freeze_text_encoder=False,
             freeze_visual_modules=False,
             use_masked_attn=True,
         ):
@@ -279,11 +280,15 @@ class MVGGT(nn.Module):
         #   Referring Segmentation
         # --------------------------------
         self.use_referring_segmentation = use_referring_segmentation
+        self.freeze_text_encoder = freeze_text_encoder
         if self.use_referring_segmentation:
             self.text_encoder = RobertaModel.from_pretrained(text_model_name, add_pooling_layer=False)
             roberta_dim = self.text_encoder.config.hidden_size
 
             self.text_proj = nn.Linear(roberta_dim, self.dec_embed_dim)
+            if self.freeze_text_encoder:
+                print('Freezing the text encoder.')
+                freeze_all_params([self.text_encoder])
 
             self.dec_num_heads = dec_num_heads
             
@@ -497,9 +502,15 @@ class MVGGT(nn.Module):
                 final_output.append(hidden.reshape(B*N, hw, -1))
 
         if self.use_referring_segmentation:
-            return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1), layer_mask_preds
+            contrastive_patch_features = multimodal_hidden.reshape(B, N, hw, -1)[:, :, self.patch_start_idx:]
+            return (
+                torch.cat([final_output[0], final_output[1]], dim=-1),
+                pos.reshape(B*N, hw, -1),
+                layer_mask_preds,
+                contrastive_patch_features,
+            )
         else:
-            return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1), None
+            return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1), None, None
 
     def predict_mask(self, hidden, H, W):
         patch_h, patch_w = H // 14, W // 14
@@ -509,7 +520,26 @@ class MVGGT(nn.Module):
         mask = F.interpolate(mask, size=(H, W), mode='bilinear', align_corners=False)
         return mask
     
-    def forward(self, imgs, input_ids=None, attention_mask=None):
+    def _project_scene_text_features(self, scene_text_features, device):
+        if scene_text_features is None:
+            return None
+
+        if torch.is_tensor(scene_text_features):
+            if scene_text_features.ndim == 2:
+                scene_text_features = [scene_text_features]
+            else:
+                scene_text_features = [scene_text_features[i] for i in range(scene_text_features.shape[0])]
+
+        projected = []
+        for features in scene_text_features:
+            if features is None:
+                projected.append(None)
+                continue
+            features = features.to(device=device, dtype=self.text_proj.weight.dtype)
+            projected.append(self.text_proj(features).float())
+        return projected
+
+    def forward(self, imgs, input_ids=None, attention_mask=None, scene_text_features=None):
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -524,12 +554,23 @@ class MVGGT(nn.Module):
 
         text_embeds_proj, attention_mask_proj = None, None
         if self.use_referring_segmentation:
-            text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+            if self.freeze_text_encoder:
+                with torch.no_grad():
+                    text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
             text_embeds = text_outputs.last_hidden_state
             text_embeds_proj = self.text_proj(text_embeds)
             attention_mask_proj = attention_mask
 
-        hidden, pos, layer_mask_preds = self.decode(hidden, N, H, W, text_embeds=text_embeds_proj, attention_mask=attention_mask_proj)
+        hidden, pos, layer_mask_preds, contrastive_patch_features = self.decode(
+            hidden,
+            N,
+            H,
+            W,
+            text_embeds=text_embeds_proj,
+            attention_mask=attention_mask_proj,
+        )
 
         point_hidden = self.point_decoder(hidden, xpos=pos)
         if self.train_conf:
@@ -544,6 +585,14 @@ class MVGGT(nn.Module):
         if self.use_referring_segmentation:
             output['layer_referring_mask_preds'] = layer_mask_preds[:-1]
             output['referring_mask_pred'] = layer_mask_preds[-1]
+            output['contrastive_patch_features'] = contrastive_patch_features
+            output['contrastive_patch_shape'] = (patch_h, patch_w)
+            output['contrastive_text_features'] = text_embeds_proj
+            output['contrastive_attention_mask'] = attention_mask_proj
+            output['contrastive_scene_text_features'] = self._project_scene_text_features(
+                scene_text_features,
+                imgs.device,
+            )
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # local points

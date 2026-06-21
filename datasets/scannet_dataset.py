@@ -27,6 +27,7 @@ class ScannetDataset(BaseDataset):
         text_model_name='./ckpts/roberta-base',
         text_max_len=64,
         dataset_source='scanrefer',
+        scene_text_feature_cache=None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -40,6 +41,8 @@ class ScannetDataset(BaseDataset):
         self.dataset_source = dataset_source
         self.max_distance = max_distance
         self.neg_frame_ratio = 0.5
+        self.scene_text_feature_cache = scene_text_feature_cache
+        self.scene_text_bank = None
 
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(text_model_name, use_fast=True, local_files_only=True)
@@ -123,6 +126,7 @@ class ScannetDataset(BaseDataset):
 
         # Create a sample list based on text descriptions
         self.all_samples = []
+        self.scene_to_sample_indices = {}
         for scene_id, annotations in self.scanrefer_data.items():
             if scene_id in self.scene_to_idx:
                 scene_idx = self.scene_to_idx[scene_id]
@@ -140,6 +144,7 @@ class ScannetDataset(BaseDataset):
                         sample['meta_data'] = ann.get('meta_data')
                         sample['view_dependent'] = ann.get('view_dependent')
                         
+                    self.scene_to_sample_indices.setdefault(scene_id, []).append(len(self.all_samples))
                     self.all_samples.append(sample)
 
         with open('data/scannet_invalid_list.json') as f:
@@ -176,9 +181,59 @@ class ScannetDataset(BaseDataset):
         self._missing_scene_frame_indices = set()
         self._current_target_id = None
 
+        if self.scene_text_feature_cache is not None:
+            self._load_scene_text_feature_cache(self.scene_text_feature_cache)
+
     def __len__(self):
         '''Return the total number of text descriptions in the dataset.'''
         return len(self.all_samples)
+
+    def get_scene_id_for_sample(self, idx):
+        return self.all_samples[int(idx)]['scene_id']
+
+    def get_object_id_for_sample(self, idx):
+        return self.all_samples[int(idx)]['object_id']
+
+    def get_sample_indices_for_scene(self, scene_id):
+        return self.scene_to_sample_indices.get(scene_id, [])
+
+    def _load_scene_text_feature_cache(self, cache_path):
+        cache_path = os.path.expanduser(str(cache_path))
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(f"Scene text feature cache not found: {cache_path}")
+
+        cache = torch.load(cache_path, map_location='cpu')
+        required_keys = ('features', 'object_ids', 'ann_ids', 'scene_to_indices')
+        missing_keys = [key for key in required_keys if key not in cache]
+        if missing_keys:
+            raise KeyError(f"Scene text feature cache missing keys: {missing_keys}")
+
+        self.scene_text_bank = {
+            'features': cache['features'].float(),
+            'object_ids': cache['object_ids'].long(),
+            'ann_ids': cache['ann_ids'].long(),
+            'scene_to_indices': cache['scene_to_indices'],
+        }
+        print(
+            f"[{self.dataset_label}] Loaded scene text feature cache from {cache_path} "
+            f"({self.scene_text_bank['features'].shape[0]} texts)",
+            flush=True,
+        )
+
+    def _scene_text_info(self, scene_id):
+        if self.scene_text_bank is None:
+            return None
+
+        indices = self.scene_text_bank['scene_to_indices'].get(scene_id, [])
+        if len(indices) == 0:
+            return None
+
+        indices = torch.as_tensor(indices, dtype=torch.long)
+        return {
+            'scene_text_features': self.scene_text_bank['features'].index_select(0, indices),
+            'scene_text_object_ids': self.scene_text_bank['object_ids'].index_select(0, indices),
+            'scene_text_ann_ids': self.scene_text_bank['ann_ids'].index_select(0, indices),
+        }
 
     def _load_scene_frame_indices(self, scene):
         if scene in self.scene_frame_indices_cache:
@@ -279,6 +334,10 @@ class ScannetDataset(BaseDataset):
             'object_id': object_id,
             'ann_id': ann_id,
         }
+
+        scene_text_info = self._scene_text_info(sample_info['scene_id'])
+        if scene_text_info is not None:
+            text_info.update(scene_text_info)
 
 
         if self.dataset_source in ['nr3d', 'sr3d']:
@@ -408,5 +467,3 @@ class ScannetDataset(BaseDataset):
                 instance_map=instance2d,
             ))
         return views
-
-

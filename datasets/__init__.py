@@ -138,7 +138,7 @@ def create_dataloader(cfg, mode):
     world_size = get_world_size()
     rank = get_rank()
 
-    image_num_range = cfg.train.image_num_range if mode == 'train' else [8, 8]
+    image_num_range = cfg.train.image_num_range if mode == 'train' else cfg.test.image_num_range
     print(f'Sampling frame number range from {image_num_range}')
     
     # Determine the maximum number of images per GPU to manage memory.
@@ -160,7 +160,9 @@ def create_dataloader(cfg, mode):
         image_num_range, 
         seed=cfg.train.base_seed,
         max_img_per_gpu=max_img_per_gpu,
-        rank=rank
+        rank=rank,
+        same_scene_in_batch=mode == 'train' and 'same_scene_in_batch' in cfg.train and cfg.train.same_scene_in_batch,
+        same_scene_fill_strategy=cfg.train.same_scene_fill_strategy if 'same_scene_fill_strategy' in cfg.train else "random",
     )
 
     # --- 4. Create and Return the DataLoader ---

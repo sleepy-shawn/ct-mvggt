@@ -5,8 +5,9 @@ train_dataset:
 
     ScanNet:
         _target_: datasets.scannet_dataset.ScannetDataset
-        data_root: data/scannet_data
+        data_root: /data/shuting/data/ScanNet
         dataset_source: 'scanrefer'
+        scene_text_feature_cache: null
         z_far: 80
         frame_num: 8
         aug_crop: 16
@@ -24,8 +25,9 @@ test_dataset:
 
     ScanNet:
         _target_: datasets.scannet_dataset.ScannetDataset
-        data_root: data/scannet_data
+        data_root: /data/shuting/data/ScanNet
         dataset_source: 'scanrefer'
+        scene_text_feature_cache: null
         z_far: 80
         frame_num: 8
         resolution:

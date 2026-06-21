@@ -10,6 +10,7 @@ model:
     num_dec_blk_not_to_checkpoint: 4
     ckpt: null
     use_referring_segmentation: true
+    freeze_text_encoder: false
     freeze_visual_modules: false
 loss:
     train_loss: 

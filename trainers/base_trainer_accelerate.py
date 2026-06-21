@@ -1167,7 +1167,7 @@ class BaseTrainer:
             if np.isscalar(v):
                 log_scaler[prefix+'/'+k] = v
                 continue
-            if Image.isImageType(v):
+            if isinstance(v, Image.Image):
                 log_img[prefix+'/'+k] = v
 
         self.accelerator.log(log_scaler, step)

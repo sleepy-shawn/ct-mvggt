@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+ckpts
+data/ScanRefer
+data/dataset_cache
+data/text_feature_cache
+outputs

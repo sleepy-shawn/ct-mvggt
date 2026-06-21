@@ -9,7 +9,7 @@ train_dataset:
         dataset_source: 'scanrefer'
         scene_text_feature_cache: null
         z_far: 80
-        frame_num: 8
+        frame_num: 4
         aug_crop: 16
         transform:
             _partial_: true
@@ -29,7 +29,7 @@ test_dataset:
         dataset_source: 'scanrefer'
         scene_text_feature_cache: null
         z_far: 80
-        frame_num: 8
+        frame_num: 4
         resolution:
             - [518, 336]
         transform:

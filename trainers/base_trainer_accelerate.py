@@ -140,6 +140,12 @@ class BaseTrainer:
         ## 6. Prepare accelerate training
         self.prepare_training()
 
+    @staticmethod
+    def _all_reduce_sum_if_distributed(tensor):
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor
+
     def build_optimizer(self, cfg_optimizer, model, param_group_fn=None):
         return build_optimizer(cfg_optimizer, model, param_group_fn=param_group_fn)
 
@@ -529,7 +535,7 @@ class BaseTrainer:
             samples_without_ann_id
         ], device=self.accelerator.device, dtype=torch.long)
         
-        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+        self._all_reduce_sum_if_distributed(stats_tensor)
 
         # Calculate and log unique/multiple accuracy metrics
         final_metrics = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -758,7 +764,7 @@ class BaseTrainer:
         total_val_samples = len(self.test_loader.dataset)
         # Gather total samples from all processes for accurate counting
         total_samples_tensor = torch.tensor(total_samples, device=self.accelerator.device)
-        dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
+        self._all_reduce_sum_if_distributed(total_samples_tensor)
         total_samples_all_gpus = total_samples_tensor.item()
 
         self.log_info(f"Validation finished. Processed {total_samples_all_gpus}/{total_val_samples} samples.")

@@ -1,4 +1,5 @@
 import datetime
+import inspect
 import os
 import random
 from accelerate import Accelerator
@@ -1244,21 +1245,34 @@ class BaseTrainer:
             dynamic=self.cfg.train.get("dynamic_compile", True),
         )
         
+        dataloader_config_kwargs = dict(
+            non_blocking=True,
+            split_batches=False,
+            dispatch_batches=None,
+            even_batches=True,
+            use_seedable_sampler=False,
+        )
+        try:
+            dataloader_config = DataLoaderConfiguration(**dataloader_config_kwargs)
+        except TypeError as exc:
+            if "non_blocking" not in str(exc):
+                raise
+            dataloader_config_kwargs.pop("non_blocking")
+            dataloader_config = DataLoaderConfiguration(**dataloader_config_kwargs)
+
         accelerate_config = dict(
             gradient_accumulation_steps=self.cfg.train.gradient_accumulation_steps,
             mixed_precision=mixed_precision,
             log_with=log_with,
             project_config=accelerator_project_config,
-            dataloader_config=DataLoaderConfiguration(
-                non_blocking=True,
-                split_batches=False,
-                dispatch_batches=None,
-                even_batches=True,
-                use_seedable_sampler=False,
-            ),
+            dataloader_config=dataloader_config,
             step_scheduler_with_optimizer=False,             # not to step n_gpus times per step.
-            dynamo_plugin=dynamo_plugin,
         )
+        accelerator_params = inspect.signature(Accelerator).parameters
+        if "dynamo_plugin" in accelerator_params:
+            accelerate_config["dynamo_plugin"] = dynamo_plugin
+        elif "dynamo_backend" in accelerator_params:
+            accelerate_config["dynamo_backend"] = dynamo_backend
 
         # fsdp
         if self.cfg.get("fsdp_plugin"):

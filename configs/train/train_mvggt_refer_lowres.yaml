@@ -43,6 +43,8 @@ loss:
       loss_contrastive: 0.1
     contrastive_temperature: 0.1
     contrastive_mode: patch_anchor_text_mask_ratio
+    contrastive_loss_version: ori
+    contrastive_pos_normalize: true
     contrastive_mask_ratio_threshold: 0.2
     contrastive_mask_ratio_metric: view_presence
 

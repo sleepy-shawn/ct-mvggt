@@ -381,6 +381,8 @@ class ReferringMaskLoss(nn.Module):
         contrastive_mode=None,
         contrastive_mask_ratio_threshold=0.2,
         contrastive_mask_ratio_metric="view_presence",
+        contrastive_loss_version="ori",
+        contrastive_pos_normalize=True,
     ):
         super().__init__()
         self.weight_dict = weight_dict if weight_dict is not None else {'loss_mask': 1, 'loss_dice': 1}
@@ -389,6 +391,8 @@ class ReferringMaskLoss(nn.Module):
         self.contrastive_mode = contrastive_mode
         self.contrastive_mask_ratio_threshold = contrastive_mask_ratio_threshold
         self.contrastive_mask_ratio_metric = contrastive_mask_ratio_metric
+        self.contrastive_loss_version = contrastive_loss_version
+        self.contrastive_pos_normalize = contrastive_pos_normalize
 
     @staticmethod
     def _metadata_to_str_list(values):
@@ -462,6 +466,32 @@ class ReferringMaskLoss(nn.Module):
         mean_pos_count = logits.new_tensor(sum(pos_counts) / len(pos_counts))
         mean_neg_count = logits.new_tensor(sum(neg_counts) / len(neg_counts))
         return loss, valid_anchor_rate, mean_pos_count, mean_neg_count
+
+    def _scene_object_contrastive_loss_for_anchor(self, logits, pos_mask, neg_mask):
+        pos_logits = logits[pos_mask]
+        neg_logits = logits[neg_mask]
+        if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+            return None
+
+        if self.contrastive_loss_version == "ori":
+            diff = neg_logits[:, None] - pos_logits[None, :]
+            diff = diff.reshape(-1)
+            diff = torch.cat([diff, logits.new_zeros(1)], dim=0)
+            return torch.logsumexp(diff, dim=0)
+
+        if self.contrastive_loss_version == "unbiased":
+            stable_logits = logits - logits.max().detach()
+            exp_logits = torch.exp(stable_logits)
+            if self.contrastive_pos_normalize:
+                pos_weights = pos_mask.to(dtype=logits.dtype)
+                pos_weights = pos_weights / pos_weights.sum().clamp_min(1.0)
+                exp_logits_input = (exp_logits * pos_weights).sum() + exp_logits[neg_mask].sum()
+            else:
+                exp_logits_input = exp_logits[pos_mask | neg_mask].sum()
+            log_prob = stable_logits - torch.log(exp_logits_input.clamp_min(1e-12))
+            return -(log_prob[pos_mask].sum() / pos_mask.sum().clamp_min(1))
+
+        raise ValueError(f"Unknown contrastive_loss_version: {self.contrastive_loss_version}")
 
     def _cross_text_mask_ratios(self, instance_maps, scene_ids, object_ids):
         B, V, H, W = instance_maps.shape
@@ -626,10 +656,10 @@ class ReferringMaskLoss(nn.Module):
 
             pos_rank = 1.0 + (logits[None, :] > pos_logits[:, None]).float().sum(dim=1)
             pos_neg_pair_accuracy = (pos_logits[:, None] > neg_logits[None, :]).float().mean()
-            diff = neg_logits[:, None] - pos_logits[None, :]
-            diff = diff.reshape(-1)
-            diff = torch.cat([diff, logits.new_zeros(1)], dim=0)
-            losses.append(torch.logsumexp(diff, dim=0))
+            contrastive_loss = self._scene_object_contrastive_loss_for_anchor(logits, pos_mask, neg_mask)
+            if contrastive_loss is None:
+                continue
+            losses.append(contrastive_loss)
             pos_counts.append(float(pos_logits.numel()))
             neg_counts.append(float(neg_logits.numel()))
             scene_text_counts.append(float(text_features.shape[0]))
@@ -747,6 +777,8 @@ class MVGGTLoss(nn.Module):
         contrastive_mode=None,
         contrastive_mask_ratio_threshold=0.2,
         contrastive_mask_ratio_metric="view_presence",
+        contrastive_loss_version="ori",
+        contrastive_pos_normalize=True,
     ):
         super().__init__()
         self.point_loss = PointLoss(train_conf=train_conf)
@@ -760,6 +792,8 @@ class MVGGTLoss(nn.Module):
                 contrastive_mode=contrastive_mode,
                 contrastive_mask_ratio_threshold=contrastive_mask_ratio_threshold,
                 contrastive_mask_ratio_metric=contrastive_mask_ratio_metric,
+                contrastive_loss_version=contrastive_loss_version,
+                contrastive_pos_normalize=contrastive_pos_normalize,
             )
 
     def prepare_gt(self, gt):
